@@ -196,6 +196,35 @@
       return clean1 === clean2 || clean1.includes(clean2) || clean2.includes(clean1);
     };
 
+    const normalizeAuthorizedEmails = (val) => {
+      if (!val) return [];
+      let rawList = [];
+      if (Array.isArray(val)) {
+        rawList = val;
+      } else if (typeof val === "string") {
+        const trimmed = val.trim();
+        if (!trimmed) return [];
+        if (trimmed.startsWith("[")) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            if (Array.isArray(parsed)) rawList = parsed;
+          } catch (e) {
+            rawList = trimmed.split(/[,;\s]+/);
+          }
+        } else {
+          rawList = trimmed.split(/[,;\s]+/);
+        }
+      }
+      const seen = new Set();
+      return rawList
+        .map(em => String(em || "").trim().toLowerCase())
+        .filter(em => {
+          if (!em || !em.includes("@") || seen.has(em)) return false;
+          seen.add(em);
+          return true;
+        });
+    };
+
     const normalizeDateInput = (val) => {
       if (!val) return "";
       const s = String(val).trim();
@@ -1004,7 +1033,8 @@
             stagePayload.jobTitle ? `jobTitle=${encodeURIComponent(stagePayload.jobTitle)}` : "",
             stagePayload.department ? `department=${encodeURIComponent(stagePayload.department)}` : "",
             stagePayload.requesterName ? `requesterName=${encodeURIComponent(stagePayload.requesterName)}` : "",
-            stagePayload.candidateName !== undefined ? `candidateName=${encodeURIComponent(stagePayload.candidateName)}` : ""
+            stagePayload.candidateName !== undefined ? `candidateName=${encodeURIComponent(stagePayload.candidateName)}` : "",
+            stagePayload.authorizedEmails !== undefined ? `authorizedEmails=${encodeURIComponent(JSON.stringify(normalizeAuthorizedEmails(stagePayload.authorizedEmails)))}` : ""
           ].filter(Boolean).join("&");
 
           targetUrls.forEach(scriptUrl => {
@@ -1220,6 +1250,7 @@
                           slotStatus: remReq.requestStatus || "PENDING_ADMIN",
                           workflowStatus: remReq.workflowStatus || "PENDING_ADMIN",
                           stage: remReq.stage || "received",
+                          jobTitle: remReq.jobTitle || "",
                           candidateName: remReq.candidateName || "",
                           candidatePhone: remReq.candidatePhone || "",
                           resumeUrl: remReq.driveUrl || "",
@@ -1228,11 +1259,33 @@
                           evaluations: []
                         }));
 
-                    const slots = rawSlots.filter(s => !currentDeletedSlots.has(s.slotId));
+                    const slots = rawSlots
+                      .filter(s => !currentDeletedSlots.has(s.slotId))
+                      .map(s => ({
+                        ...s,
+                        jobTitle: (s.jobTitle && s.jobTitle !== "New Position") ? s.jobTitle : (remReq.jobTitle || s.jobTitle || ""),
+                        authorizedEmails: normalizeAuthorizedEmails(s.authorizedEmails)
+                      }));
                     if (slots.length > 0) {
                       const newEntry = { ...remReq, slots };
                       baseList.unshift(newEntry);
                       existingMap.set(remReq.id, newEntry);
+                    }
+                  } else {
+                    const existingReq = existingMap.get(remReq.id);
+                    if (existingReq) {
+                      if ((!existingReq.jobTitle || existingReq.jobTitle === "New Position") && remReq.jobTitle && remReq.jobTitle !== "New Position") {
+                        existingReq.jobTitle = remReq.jobTitle;
+                      }
+                      if ((!existingReq.requesterName || existingReq.requesterName === "-") && remReq.requesterName && remReq.requesterName !== "-") {
+                        existingReq.requesterName = remReq.requesterName;
+                      }
+                      if ((!existingReq.department || existingReq.department === "-") && remReq.department && remReq.department !== "-") {
+                        existingReq.department = remReq.department;
+                      }
+                      if ((!existingReq.division || existingReq.division === "-") && remReq.division && remReq.division !== "-") {
+                        existingReq.division = remReq.division;
+                      }
                     }
                   }
                 });
@@ -1247,34 +1300,48 @@
                   const parentId = stageData.parentRequestId || stageData.requisitionData?.id || String(slotKey).replace(/-\d+$/, "");
                   if (!parentId || deletedReqIds.has(parentId) || currentDeletedSlots.has(parentId)) return;
 
+                  const matchedRemoteReq = remoteRequisitions.find(rr => rr.id === parentId) || {};
+                  const reqTemplate = { ...matchedRemoteReq, ...(stageData.requisitionData || {}) };
+                  const cleanTemplateTitle = (reqTemplate.jobTitle && reqTemplate.jobTitle !== "New Position") ? reqTemplate.jobTitle : "";
+                  const cleanStageTitle = (stageData.jobTitle && stageData.jobTitle !== "New Position") ? stageData.jobTitle : "";
+                  const resolvedTitle = cleanTemplateTitle || cleanStageTitle;
+
                   if (!existingMap.has(parentId)) {
-                    const reqTemplate = stageData.requisitionData || {};
                     const headcount = Math.max(1, Number(reqTemplate.headcountRequired) || 1);
                     const reconstructedSlots = (Array.isArray(reqTemplate.slots) && reqTemplate.slots.length > 0)
                       ? reqTemplate.slots.map(sl => {
                           const sOver = slotStages[sl.slotId] || (sl.slotId === slotKey ? stageData : {});
+                          const sOverTitle = (sOver.jobTitle && sOver.jobTitle !== "New Position") ? sOver.jobTitle : "";
+                          const slTitle = (sl.jobTitle && sl.jobTitle !== "New Position") ? sl.jobTitle : "";
                           return {
                             ...sl,
+                            jobTitle: sOverTitle || slTitle || resolvedTitle || "Manpower Requisition",
                             stage: sOver.stage || sl.stage || "received",
                             slotStatus: sOver.slotStatus || sl.slotStatus || "PENDING_ADMIN",
                             workflowStatus: sOver.workflowStatus || sl.workflowStatus || "PENDING_ADMIN",
-                            authorizedEmails: Array.isArray(sOver.authorizedEmails) ? sOver.authorizedEmails : (sl.authorizedEmails || [])
+                            authorizedEmails: sOver.authorizedEmails !== undefined
+                              ? normalizeAuthorizedEmails(sOver.authorizedEmails)
+                              : normalizeAuthorizedEmails(sl.authorizedEmails)
                           };
                         })
                       : Array.from({ length: headcount }, (_, i) => {
                           const sid = `${parentId}-${i + 1}`;
                           const sOver = slotStages[sid] || (sid === slotKey ? stageData : {});
+                          const sOverTitle = (sOver.jobTitle && sOver.jobTitle !== "New Position") ? sOver.jobTitle : "";
                           return {
                             slotId: sid,
                             slotIndex: i + 1,
                             slotStatus: sOver.slotStatus || stageData.slotStatus || "PENDING_ADMIN",
                             workflowStatus: sOver.workflowStatus || stageData.workflowStatus || "PENDING_ADMIN",
                             stage: sOver.stage || stageData.stage || "received",
+                            jobTitle: sOverTitle || resolvedTitle || "Manpower Requisition",
                             candidateName: sOver.candidateName || "",
                             candidatePhone: sOver.candidatePhone || "",
                             candidateNickname: sOver.candidateNickname || "",
                             resumeUrl: sOver.resumeUrl || "",
-                            authorizedEmails: Array.isArray(sOver.authorizedEmails) ? sOver.authorizedEmails : [],
+                            authorizedEmails: sOver.authorizedEmails !== undefined
+                              ? normalizeAuthorizedEmails(sOver.authorizedEmails)
+                              : [],
                             evaluations: []
                           };
                         });
@@ -1293,7 +1360,7 @@
                         candidateSupervisor: reqTemplate.candidateSupervisor || "-",
                         approverName: reqTemplate.approverName || "ศรัณย์ภัทธ อุบล",
                         approverEmail: reqTemplate.approverEmail || "sarunpat.ub@valuesourcing.co",
-                        jobTitle: reqTemplate.jobTitle || stageData.jobTitle || "New Position",
+                        jobTitle: resolvedTitle || "Manpower Requisition",
                         headcountRequired: validSlots.length,
                         positionType: reqTemplate.positionType || "New Headcount",
                         replacedEmployeeName: reqTemplate.replacedEmployeeName || "",
@@ -1320,25 +1387,45 @@
                       existingMap.set(parentId, reconstructedReq);
                     }
                   } else {
-                    // หากมีคำขอนี้แล้ว ตรวจสอบว่ามี Slot ใหม่ที่ถูกคัดลอกมาจากหน้าต่างอื่นหรือไม่
+                    // หากมีคำขอนี้แล้ว อัปเดตข้อมูลที่อาจขาดหายและตรวจสอบ Slot ใหม่ที่ถูกคัดลอกมาจากหน้าต่างอื่น
                     const targetParent = existingMap.get(parentId);
-                    if (targetParent && Array.isArray(targetParent.slots) && !targetParent.slots.some(sl => sl.slotId === slotKey)) {
-                      const idxMatch = String(slotKey).match(/-(\d+)$/);
-                      const slotIdx = idxMatch ? parseInt(idxMatch[1], 10) : (targetParent.slots.length + 1);
-                      targetParent.slots.push({
-                        slotId: slotKey,
-                        slotIndex: slotIdx,
-                        slotStatus: stageData.slotStatus || "READY_FOR_RECRUITMENT",
-                        workflowStatus: stageData.workflowStatus || "READY_FOR_RECRUITMENT",
-                        stage: stageData.stage || "manpower",
-                        jobTitle: stageData.jobTitle || targetParent.jobTitle,
-                        candidateName: stageData.candidateName || "",
-                        candidatePhone: stageData.candidatePhone || "",
-                        candidateNickname: stageData.candidateNickname || "",
-                        resumeUrl: stageData.resumeUrl || "",
-                        authorizedEmails: Array.isArray(stageData.authorizedEmails) ? stageData.authorizedEmails : [],
-                        evaluations: []
-                      });
+                    if (targetParent) {
+                      if ((!targetParent.jobTitle || targetParent.jobTitle === "New Position") && resolvedTitle) {
+                        targetParent.jobTitle = resolvedTitle;
+                      }
+                      if ((!targetParent.requesterName || targetParent.requesterName === "-") && (reqTemplate.requesterName || stageData.requesterName)) {
+                        targetParent.requesterName = reqTemplate.requesterName || stageData.requesterName;
+                      }
+                      if ((!targetParent.department || targetParent.department === "-") && (reqTemplate.department || stageData.department)) {
+                        targetParent.department = reqTemplate.department || stageData.department;
+                      }
+                      if ((!targetParent.division || targetParent.division === "-") && reqTemplate.division) {
+                        targetParent.division = reqTemplate.division;
+                      }
+                      if (Array.isArray(targetParent.slots)) {
+                        targetParent.slots = targetParent.slots.map(sl => ({
+                          ...sl,
+                          jobTitle: (sl.jobTitle && sl.jobTitle !== "New Position") ? sl.jobTitle : (resolvedTitle || targetParent.jobTitle)
+                        }));
+                        if (!targetParent.slots.some(sl => sl.slotId === slotKey)) {
+                          const idxMatch = String(slotKey).match(/-(\d+)$/);
+                          const slotIdx = idxMatch ? parseInt(idxMatch[1], 10) : (targetParent.slots.length + 1);
+                          targetParent.slots.push({
+                            slotId: slotKey,
+                            slotIndex: slotIdx,
+                            slotStatus: stageData.slotStatus || "READY_FOR_RECRUITMENT",
+                            workflowStatus: stageData.workflowStatus || "READY_FOR_RECRUITMENT",
+                            stage: stageData.stage || "manpower",
+                            jobTitle: cleanStageTitle || targetParent.jobTitle,
+                            candidateName: stageData.candidateName || "",
+                            candidatePhone: stageData.candidatePhone || "",
+                            candidateNickname: stageData.candidateNickname || "",
+                            resumeUrl: stageData.resumeUrl || "",
+                            authorizedEmails: normalizeAuthorizedEmails(stageData.authorizedEmails),
+                            evaluations: []
+                          });
+                        }
+                      }
                     }
                   }
                 });
@@ -1370,13 +1457,16 @@
                   const isItConfirmed = itAckFromRemote || s.itEquipmentConfirmed || Boolean(stageOverride?.itEquipmentConfirmed);
                   const effectiveStage = hasRecentLocalUpdate ? s.stage : (stageOverride?.stage || s.stage || "received");
                   const effectiveSlotStatus = hasRecentLocalUpdate ? s.slotStatus : (stageOverride?.slotStatus || s.slotStatus);
-                  const effectiveAuthEmails = Array.isArray(stageOverride?.authorizedEmails)
-                    ? stageOverride.authorizedEmails
-                    : (Array.isArray(s.authorizedEmails) ? s.authorizedEmails : []);
+                  const effectiveAuthEmails = stageOverride && stageOverride.authorizedEmails !== undefined
+                    ? normalizeAuthorizedEmails(stageOverride.authorizedEmails)
+                    : normalizeAuthorizedEmails(s.authorizedEmails);
+                  const overrideJobTitle = (stageOverride?.jobTitle && stageOverride.jobTitle !== "New Position") ? stageOverride.jobTitle : "";
+                  const currentSlotJobTitle = (s.jobTitle && s.jobTitle !== "New Position") ? s.jobTitle : "";
+                  const parentReqJobTitle = (r.jobTitle && r.jobTitle !== "New Position") ? r.jobTitle : "";
 
                   return {
                     ...s,
-                    jobTitle: stageOverride?.jobTitle || s.jobTitle,
+                    jobTitle: overrideJobTitle || currentSlotJobTitle || parentReqJobTitle || s.jobTitle,
                     workflowStatus: newWfStatus || s.workflowStatus,
                     slotStatus: effectiveSlotStatus,
                     stage: effectiveStage,
@@ -1401,8 +1491,12 @@
 
                 const hasRecentReqSlot = updatedSlots.some(sl => sl.stageUpdatedAt && (Date.now() - sl.stageUpdatedAt < 60000));
                 const newStatus = hasRecentReqSlot ? r.requestStatus : (updatedSlots[0]?.slotStatus || remoteWfItem?.status || r.requestStatus);
+                const resolvedParentTitle = (r.jobTitle && r.jobTitle !== "New Position")
+                  ? r.jobTitle
+                  : (updatedSlots[0]?.jobTitle && updatedSlots[0].jobTitle !== "New Position" ? updatedSlots[0].jobTitle : r.jobTitle);
                 return {
                   ...r,
+                  jobTitle: resolvedParentTitle,
                   headcountRequired: updatedSlots.length,
                   requestStatus: newStatus || r.requestStatus,
                   workflowStatus: newStatus || r.workflowStatus,
@@ -1424,9 +1518,16 @@
               const remoteEvals = evalsMap[prevSlot.slotId];
 
               if (stageOverride || itAck || remoteEvals) {
+                const safeTitle = (stageOverride?.jobTitle && stageOverride.jobTitle !== "New Position")
+                  ? stageOverride.jobTitle
+                  : prevSlot.jobTitle;
                 return {
                   ...prevSlot,
                   ...(stageOverride || {}),
+                  jobTitle: safeTitle,
+                  authorizedEmails: stageOverride && stageOverride.authorizedEmails !== undefined
+                    ? normalizeAuthorizedEmails(stageOverride.authorizedEmails)
+                    : normalizeAuthorizedEmails(prevSlot.authorizedEmails),
                   itEquipmentConfirmed: itAck || prevSlot.itEquipmentConfirmed,
                   evaluations: remoteEvals || prevSlot.evaluations || []
                 };
@@ -1647,8 +1748,8 @@
       const canUserViewSlotDetails = (slotItem) => {
         if (isAdminAuthenticated) return true;
         if (!activeUserEmail || !slotItem) return false;
-        const allowedList = Array.isArray(slotItem.authorizedEmails) ? slotItem.authorizedEmails : [];
-        return allowedList.some(em => String(em || "").trim().toLowerCase() === activeUserEmail);
+        const allowedList = normalizeAuthorizedEmails(slotItem.authorizedEmails);
+        return allowedList.includes(activeUserEmail);
       };
 
       // 🔒 สิทธิ์การมองเห็น: หากไม่ใช่แอดมิน (User View) ให้ล็อกหน้าจอให้อยู่ที่กระดาน Kanban Pipeline & Demand เท่านั้น
@@ -2758,7 +2859,7 @@
               itEquipmentConfirmed: Boolean(slot.itEquipmentConfirmed),
               hasAttendedFirstDayTraining: Boolean(slot.hasAttendedFirstDayTraining || arrivalStatus === "arrived_reported"),
               rejectionReason: slot.rejectionReason || r.rejectionReason || "",
-              authorizedEmails: Array.isArray(slot.authorizedEmails) ? slot.authorizedEmails : [],
+              authorizedEmails: normalizeAuthorizedEmails(slot.authorizedEmails),
               isArchivedFromKanban: !!slot.isArchivedFromKanban,
               isItNotified: Boolean(slot.isItNotified || r.isItNotified)
             };
@@ -4021,10 +4122,12 @@ if (action === "syncTADashboardSummary" && data.summary) {
                     slotStatus: "PENDING_ADMIN",
                     workflowStatus: "PENDING_ADMIN",
                     stage: "received",
+                    jobTitle: r.jobTitle,
                     candidateName: "",
                     candidatePhone: "",
                     candidateNickname: "",
                     resumeUrl: "",
+                    authorizedEmails: [],
                     evaluations: []
                   }));
 
@@ -4032,6 +4135,7 @@ if (action === "syncTADashboardSummary" && data.summary) {
                 if (s.slotId === slotId) {
                   return {
                     ...s,
+                    jobTitle: s.jobTitle || r.jobTitle,
                     slotStatus: "READY_FOR_RECRUITMENT",
                     workflowStatus: "READY_FOR_RECRUITMENT",
                     stage: "manpower",
@@ -4062,12 +4166,19 @@ if (action === "syncTADashboardSummary" && data.summary) {
           localStorage.setItem(PROD_REQUESTS_KEY, JSON.stringify(updatedRequests));
           broadcastCentralSync(updatedRequests, candidatePool);
 
-          // 🔄 ส่งอัปเดตสเตจของ Slot นี้ไปยังศูนย์กลาง
+          // 🔄 ส่งอัปเดตสเตจและข้อมูลตำแหน่งเดิมของ Slot นี้ไปยังศูนย์กลางครบถ้วน
+          const targetReqObj = updatedRequests.find(r => r.id === reqId || r.slots?.some(s => s.slotId === slotId));
+          const targetSlotObj = targetReqObj?.slots?.find(s => s.slotId === slotId);
           sendCentralSlotStageUpdate(slotId, {
             stage: "manpower",
             slotStatus: "READY_FOR_RECRUITMENT",
             workflowStatus: "READY_FOR_RECRUITMENT",
-            parentRequestId: reqId
+            parentRequestId: targetReqObj?.id || reqId,
+            jobTitle: targetSlotObj?.jobTitle || targetReqObj?.jobTitle || "",
+            department: targetReqObj?.department || "-",
+            requesterName: targetReqObj?.requesterName || "-",
+            authorizedEmails: normalizeAuthorizedEmails(targetSlotObj?.authorizedEmails),
+            requisitionData: targetReqObj
           }, updatedRequests);
 
           if (selectedRequisitionDetail && selectedRequisitionDetail.id === reqId) {
@@ -4791,15 +4902,18 @@ if (action === "syncTADashboardSummary" && data.summary) {
                 : Array.from({ length: headcount }, (_, i) => ({
                     slotId: `${r.id}-${i + 1}`,
                     slotIndex: i + 1,
+                    jobTitle: r.jobTitle,
                     candidateName: "",
                     candidatePhone: "",
                     candidateNickname: "",
                     resumeUrl: "",
+                    authorizedEmails: [],
                     evaluations: []
                   }));
 
               const updatedSlots = baseSlots.map(s => ({
                 ...s,
+                jobTitle: s.jobTitle || r.jobTitle,
                 slotStatus: "READY_FOR_RECRUITMENT",
                 workflowStatus: "READY_FOR_RECRUITMENT",
                 stage: "manpower",
@@ -4825,20 +4939,29 @@ if (action === "syncTADashboardSummary" && data.summary) {
           // 🌟 ส่งสัญญาณกระจายไปยังทุกหน้าต่างทันที (0ms)
           broadcastCentralSync(updatedRequests, candidatePool);
 
-          // 🔄 ส่งอัปเดตสถานะของทุก Slot ในคำขอนี้ไปยังศูนย์กลาง Apps Script
+          // 🔄 ส่งอัปเดตสถานะและข้อมูลตำแหน่งเดิมของทุก Slot ในคำขอนี้ไปยังศูนย์กลาง Apps Script
           const updatedReqObj = updatedRequests.find(r => r.id === parentReqId) || targetReq;
-          const headcount = Math.max(1, Number(updatedReqObj.headcountRequired) || 1);
-          for (let i = 1; i <= headcount; i++) {
-            sendCentralSlotStageUpdate(`${parentReqId}-${i}`, {
+          const slotsToSync = Array.isArray(updatedReqObj.slots) && updatedReqObj.slots.length > 0
+            ? updatedReqObj.slots
+            : Array.from({ length: Math.max(1, Number(updatedReqObj.headcountRequired) || 1) }, (_, idx) => ({
+                slotId: `${parentReqId}-${idx + 1}`,
+                jobTitle: updatedReqObj.jobTitle,
+                authorizedEmails: []
+              }));
+
+          slotsToSync.forEach(sl => {
+            sendCentralSlotStageUpdate(sl.slotId, {
               stage: "manpower",
               slotStatus: "READY_FOR_RECRUITMENT",
               workflowStatus: "READY_FOR_RECRUITMENT",
               parentRequestId: parentReqId,
-              jobTitle: updatedReqObj.jobTitle,
+              jobTitle: sl.jobTitle || updatedReqObj.jobTitle,
               department: updatedReqObj.department,
+              requesterName: updatedReqObj.requesterName,
+              authorizedEmails: normalizeAuthorizedEmails(sl.authorizedEmails),
               requisitionData: updatedReqObj
             }, updatedRequests);
-          }
+          });
 
           // Background sync to Google Sheet
           if (googleScriptUrl) {
