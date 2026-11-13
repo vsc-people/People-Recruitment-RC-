@@ -1400,11 +1400,14 @@
               // 1.1 ผสานจาก remoteRequisitions
               if (remoteRequisitions.length > 0) {
                 remoteRequisitions.forEach(remReq => {
-                  if (currentDeletedReqs.has(remReq.id) || currentDeletedSlots.has(remReq.id)) return;
+                  const isRemRejectedHistory = Boolean(remReq.isRejectedHistory || remReq.requestStatus === "REJECTED_BY_ADMIN" || remReq.workflowStatus === "REJECTED_BY_ADMIN");
+                  if (!isRemRejectedHistory && (currentDeletedReqs.has(remReq.id) || currentDeletedSlots.has(remReq.id))) return;
 
                   if (!existingMap.has(remReq.id)) {
                     const headcount = Math.max(1, Number(remReq.headcountRequired) || 1);
-                    const rawSlots = (remReq.slots && remReq.slots.length > 0)
+                    const rawSlots = isRemRejectedHistory
+                      ? []
+                      : (remReq.slots && remReq.slots.length > 0)
                       ? remReq.slots
                       : Array.from({ length: headcount }, (_, i) => ({
                           slotId: `${remReq.id}-${i + 1}`,
@@ -1428,14 +1431,30 @@
                         jobTitle: (s.jobTitle && s.jobTitle !== "New Position") ? s.jobTitle : (remReq.jobTitle || s.jobTitle || ""),
                         authorizedEmails: normalizeAuthorizedEmails(s.authorizedEmails)
                       }));
-                    if (slots.length > 0) {
-                      const newEntry = { ...remReq, slots };
+                    if (slots.length > 0 || isRemRejectedHistory) {
+                      const newEntry = {
+                        ...remReq,
+                        ...(isRemRejectedHistory ? { requestStatus: "REJECTED_BY_ADMIN", workflowStatus: "REJECTED_BY_ADMIN", stage: "cancelled" } : {}),
+                        slots
+                      };
                       baseList.unshift(newEntry);
                       existingMap.set(remReq.id, newEntry);
                     }
                   } else {
                     const existingReq = existingMap.get(remReq.id);
                     if (existingReq) {
+                      if (isRemRejectedHistory) {
+                        existingReq.requestStatus = "REJECTED_BY_ADMIN";
+                        existingReq.workflowStatus = "REJECTED_BY_ADMIN";
+                        existingReq.stage = "cancelled";
+                        if (remReq.isRejectedHistory) {
+                          existingReq.isRejectedHistory = true;
+                          existingReq.slots = [];
+                        }
+                        if (remReq.rejectionReason) {
+                          existingReq.rejectionReason = remReq.rejectionReason;
+                        }
+                      }
                       if ((!existingReq.jobTitle || existingReq.jobTitle === "New Position") && remReq.jobTitle && remReq.jobTitle !== "New Position") {
                         existingReq.jobTitle = remReq.jobTitle;
                       }
@@ -1457,10 +1476,12 @@
               if (slotStages && typeof slotStages === "object") {
                 Object.entries(slotStages).forEach(([slotKey, stageData]) => {
                   if (!stageData || typeof stageData !== "object") return;
-                  if (stageData.isDeleted || currentDeletedSlots.has(slotKey)) return;
+                  const isStageRejectedHistory = Boolean(stageData.isRejectedHistory || stageData.requisitionData?.isRejectedHistory);
+                  if (!isStageRejectedHistory && (stageData.isDeleted || currentDeletedSlots.has(slotKey))) return;
 
                   const parentId = stageData.parentRequestId || stageData.requisitionData?.id || String(slotKey).replace(/-\d+$/, "");
-                  if (!parentId || currentDeletedReqs.has(parentId) || currentDeletedSlots.has(parentId)) return;
+                  if (!parentId) return;
+                  if (!isStageRejectedHistory && (currentDeletedReqs.has(parentId) || currentDeletedSlots.has(parentId))) return;
 
                   const matchedRemoteReq = remoteRequisitions.find(rr => rr.id === parentId) || {};
                   const reqTemplate = { ...matchedRemoteReq, ...(stageData.requisitionData || {}) };
@@ -1509,7 +1530,7 @@
                         });
 
                     const validSlots = reconstructedSlots.filter(sl => !currentDeletedSlots.has(sl.slotId));
-                    if (validSlots.length > 0) {
+                    if (validSlots.length > 0 || isStageRejectedHistory) {
                       const reconstructedReq = {
                         id: parentId,
                         requestDate: reqTemplate.requestDate || new Date().toISOString().split('T')[0],
@@ -1523,7 +1544,7 @@
                         approverName: reqTemplate.approverName || "ศรัณย์ภัทธ อุบล",
                         approverEmail: reqTemplate.approverEmail || "sarunpat.ub@valuesourcing.co",
                         jobTitle: resolvedTitle || "Manpower Requisition",
-                        headcountRequired: validSlots.length,
+                        headcountRequired: isStageRejectedHistory ? (Number(reqTemplate.headcountRequired) || 1) : validSlots.length,
                         positionType: reqTemplate.positionType || "New Headcount",
                         replacedEmployeeName: reqTemplate.replacedEmployeeName || "",
                         targetDate: reqTemplate.targetDate || "",
@@ -1540,10 +1561,12 @@
                         itSimCard: reqTemplate.itSimCard || "ไม่ต้องการ",
                         itEmail: reqTemplate.itEmail || "ต้องการ",
                         itNetsuite: reqTemplate.itNetsuite || "ไม่ต้องการ",
-                        requestStatus: stageData.slotStatus || reqTemplate.requestStatus || "PENDING_ADMIN",
-                        workflowStatus: stageData.workflowStatus || reqTemplate.workflowStatus || "PENDING_ADMIN",
-                        stage: stageData.stage || reqTemplate.stage || "received",
-                        slots: validSlots
+                        requestStatus: isStageRejectedHistory ? "REJECTED_BY_ADMIN" : (stageData.slotStatus || reqTemplate.requestStatus || "PENDING_ADMIN"),
+                        workflowStatus: isStageRejectedHistory ? "REJECTED_BY_ADMIN" : (stageData.workflowStatus || reqTemplate.workflowStatus || "PENDING_ADMIN"),
+                        stage: isStageRejectedHistory ? "cancelled" : (stageData.stage || reqTemplate.stage || "received"),
+                        isRejectedHistory: isStageRejectedHistory,
+                        rejectionReason: reqTemplate.rejectionReason || stageData.rejectionReason || "",
+                        slots: isStageRejectedHistory ? [] : validSlots
                       };
                       baseList.unshift(reconstructedReq);
                       existingMap.set(parentId, reconstructedReq);
@@ -1613,11 +1636,24 @@
 
               // 2. นำสถานะกลาง (Central Live Overrides) มาใช้กับทุก Slot โดยกรองรายการที่ลบแล้วทิ้ง 100%
               const updatedList = baseList.map(r => {
+                // เก็บประวัติรายการที่ถูก Reject หรือลบตำแหน่งไว้ใน Rejected (ปฏิเสธ / ส่งกลับ) เสมอ
+                if (r.isRejectedHistory) {
+                  return {
+                    ...r,
+                    requestStatus: "REJECTED_BY_ADMIN",
+                    workflowStatus: "REJECTED_BY_ADMIN",
+                    stage: "cancelled",
+                    isRejectedHistory: true,
+                    slots: []
+                  };
+                }
+
                 if (currentDeletedReqs.has(r.id) || currentDeletedSlots.has(r.id)) return null;
 
                 const mainId = r.id;
                 const cleanId = String(mainId).replace(/-\d+$/, "");
                 const remoteWfItem = serverStatuses[mainId] || serverStatuses[cleanId];
+                const isReqRejected = (r.requestStatus === "REJECTED_BY_ADMIN" || r.workflowStatus === "REJECTED_BY_ADMIN");
 
                 const updatedSlots = (r.slots || []).map(s => {
                   if (currentDeletedSlots.has(s.slotId) || remoteDeletedSlots[s.slotId]?.isDeleted) {
@@ -1677,10 +1713,26 @@
                   };
                 }).filter(Boolean);
 
-                if (updatedSlots.length === 0) return null;
+                if (updatedSlots.length === 0) {
+                  if (isReqRejected) {
+                    return {
+                      ...r,
+                      requestStatus: "REJECTED_BY_ADMIN",
+                      workflowStatus: "REJECTED_BY_ADMIN",
+                      stage: "cancelled",
+                      isRejectedHistory: true,
+                      slots: []
+                    };
+                  }
+                  return null;
+                }
 
                 const hasRecentReqSlot = updatedSlots.some(sl => sl.stageUpdatedAt && (Date.now() - sl.stageUpdatedAt < 60000));
-                const newStatus = hasRecentReqSlot ? r.requestStatus : (updatedSlots[0]?.slotStatus || remoteWfItem?.status || r.requestStatus);
+                const newStatus = isReqRejected
+                  ? "REJECTED_BY_ADMIN"
+                  : hasRecentReqSlot
+                  ? r.requestStatus
+                  : (updatedSlots[0]?.slotStatus || remoteWfItem?.status || r.requestStatus);
                 const resolvedParentTitle = (r.jobTitle && r.jobTitle !== "New Position")
                   ? r.jobTitle
                   : (updatedSlots[0]?.jobTitle && updatedSlots[0].jobTitle !== "New Position" ? updatedSlots[0].jobTitle : r.jobTitle);
@@ -2999,7 +3051,7 @@
       const allPositionSlots = useMemo(() => {
         const seenSlotIds = new Set();
         return requests.flatMap(r => {
-          if (deletedReqIds.has(r.id)) return [];
+          if (deletedReqIds.has(r.id) || r.isRejectedHistory) return [];
 
           const headcount = Math.max(1, Number(r.headcountRequired) || (r.slots?.length || 1));
           const rawSlots = (r.slots && r.slots.length > 0) 
@@ -3309,6 +3361,7 @@
         // กลุ่มระดับใบคำขอ (Requisition Level)
         const validReqs = requests.filter(r =>
           !deletedReqIds.has(r.id) &&
+          !r.isRejectedHistory &&
           r.stage !== "cancelled" &&
           r.requestStatus !== "REJECTED_BY_ADMIN" &&
           r.workflowStatus !== "REJECTED_BY_ADMIN"
@@ -4278,7 +4331,7 @@ if (action === "syncTADashboardSummary" && data.summary) {
         triggerToast(`📋 คัดลอกตำแหน่ง "${sourceSlot.jobTitle}" สำเร็จ! เพิ่ม Slot สำหรับ Candidate อีกท่านเรียบร้อย`);
       };
 
-      // Handler for confirming slot deletion with mandatory reason
+      // Handler for confirming slot deletion with mandatory reason (พร้อมเก็บประวัติไว้ที่ Rejected)
       const handleConfirmDeleteSlot = () => {
         if (!slotToDelete) return;
         const reason = deletionReasonInput.trim();
@@ -4290,8 +4343,10 @@ if (action === "syncTADashboardSummary" && data.summary) {
         const targetSlotId = slotToDelete.slotId;
         const parentReqId = slotToDelete.parentRequestId || slotToDelete.id;
         const candName = slotToDelete.candidateName;
+        const nowStr = new Date().toISOString().replace('T', ' ').substring(0, 19);
+        const deletionHistoryNote = `ลบตำแหน่ง (${targetSlotId}): ${reason}`;
 
-        // 1. บันทึกเข้า Blacklist ถาวรทันที
+        // 1. บันทึก Slot เข้า Blacklist บนกระดาน Kanban ทันที
         const updatedDeletedSlotIds = new Set(deletedSlotIds);
         updatedDeletedSlotIds.add(targetSlotId);
         setDeletedSlotIds(updatedDeletedSlotIds);
@@ -4310,48 +4365,231 @@ if (action === "syncTADashboardSummary" && data.summary) {
           localStorage.setItem(PROD_CANDIDATES_KEY, JSON.stringify(updatedPool));
         }
 
-        // 3. ลบ Slot ออกจาก requests ทันที
+        // 3. ลบ Slot ออกจากกระดาน และเก็บประวัติไว้ใน Rejected (ปฏิเสธ / ส่งกลับ)
         let reqRemoved = false;
+        let extraRejectedHistoryEntry = null;
+        let savedHistoryRecord = null;
+
         const updatedRequests = requests.map(r => {
           if (r.id === parentReqId || (r.slots && r.slots.some(s => s.slotId === targetSlotId))) {
             const remainingSlots = (r.slots || []).filter(s => s.slotId !== targetSlotId && !updatedDeletedSlotIds.has(s.slotId));
             if (remainingSlots.length === 0) {
               reqRemoved = true;
-              return null;
+              const convertedHistoryReq = {
+                ...r,
+                jobTitle: slotToDelete.jobTitle || r.jobTitle,
+                headcountRequired: r.headcountRequired || 1,
+                requestStatus: "REJECTED_BY_ADMIN",
+                workflowStatus: "REJECTED_BY_ADMIN",
+                stage: "cancelled",
+                isRejectedHistory: true,
+                rejectionReason: deletionHistoryNote,
+                deletedAt: nowStr,
+                slots: [],
+                lastUpdated: nowStr
+              };
+              savedHistoryRecord = convertedHistoryReq;
+              return convertedHistoryReq;
             }
+
+            // กรณีคำขอมีหลายอัตรา และลบเพียงบางอัตรา ให้สร้างรายการประวัติการลบแยกไว้ใน Rejected
+            extraRejectedHistoryEntry = {
+              ...r,
+              id: targetSlotId,
+              parentRequestId: r.id,
+              slotId: targetSlotId,
+              jobTitle: slotToDelete.jobTitle || r.jobTitle,
+              headcountRequired: 1,
+              requestStatus: "REJECTED_BY_ADMIN",
+              workflowStatus: "REJECTED_BY_ADMIN",
+              stage: "cancelled",
+              isRejectedHistory: true,
+              rejectionReason: deletionHistoryNote,
+              deletedAt: nowStr,
+              slots: [],
+              lastUpdated: nowStr
+            };
+            savedHistoryRecord = extraRejectedHistoryEntry;
+
             return {
               ...r,
               headcountRequired: remainingSlots.length,
               slots: remainingSlots,
-              lastUpdated: new Date().toISOString().replace('T', ' ').substring(0, 19)
+              lastUpdated: nowStr
             };
           }
           return r;
         }).filter(Boolean);
 
-        let updatedDeletedReqIds = new Set(deletedReqIds);
-        if (reqRemoved) {
-          updatedDeletedReqIds.add(parentReqId);
-          setDeletedReqIds(updatedDeletedReqIds);
-          localStorage.setItem(DELETED_REQS_KEY, JSON.stringify(Array.from(updatedDeletedReqIds)));
+        if (extraRejectedHistoryEntry) {
+          const existingHistIdx = updatedRequests.findIndex(item => item.id === extraRejectedHistoryEntry.id);
+          if (existingHistIdx !== -1) {
+            updatedRequests[existingHistIdx] = extraRejectedHistoryEntry;
+          } else {
+            updatedRequests.unshift(extraRejectedHistoryEntry);
+          }
         }
 
+        const updatedDeletedReqIds = new Set(deletedReqIds);
         setRequests(updatedRequests);
         localStorage.setItem(PROD_REQUESTS_KEY, JSON.stringify(updatedRequests));
 
-        // 4. กระจายสัญญาณไปยังทุกแท็บ/หน้าต่างทันทีด้วยข้อมูลที่ลบแล้วและรายการ Blacklist ล่าสุด (0ms)
+        // 4. กระจายสัญญาณไปยังทุกแท็บ/หน้าต่างทันทีด้วยข้อมูลล่าสุด (0ms)
         broadcastCentralSync(updatedRequests, updatedPool, updatedDeletedSlotIds, updatedDeletedReqIds);
 
-        // 5. แจ้งลบไปยังศูนย์กลาง Apps Script เพื่อให้ทุกเซิร์ฟเวอร์และหน้าต่างลบการ์ดนี้ออกถาวร
+        // 5. แจ้งลบไปยังศูนย์กลาง Apps Script พร้อมบันทึกประวัติลง Rejected
         sendCentralSlotDeletion(targetSlotId, reason, updatedRequests, parentReqId, reqRemoved);
+        if (savedHistoryRecord) {
+          sendCentralSlotStageUpdate(savedHistoryRecord.id, {
+            stage: "cancelled",
+            slotStatus: "REJECTED_BY_ADMIN",
+            workflowStatus: "REJECTED_BY_ADMIN",
+            parentRequestId: parentReqId,
+            jobTitle: savedHistoryRecord.jobTitle,
+            department: savedHistoryRecord.department,
+            requesterName: savedHistoryRecord.requesterName,
+            rejectionReason: deletionHistoryNote,
+            isRejectedHistory: true,
+            requisitionData: savedHistoryRecord
+          }, updatedRequests);
+        }
 
         if (selectedDetailSlot && selectedDetailSlot.slotId === targetSlotId) {
           setSelectedDetailSlot(null);
         }
 
-        triggerToast(`🗑️ ลบตำแหน่ง Slot #${targetSlotId} ออกจากระบบเรียบร้อย (เหตุผล: ${reason})`);
+        triggerToast(`🗑️ ลบตำแหน่ง Slot #${targetSlotId} เรียบร้อย และเก็บประวัติไว้ที่ Rejected (ปฏิเสธ / ส่งกลับ) แล้ว`);
         setSlotToDelete(null);
         setDeletionReasonInput("");
+      };
+
+      // Confirm Rejection / Cancellation with Mandatory Reason (พร้อมเก็บประวัติไว้ที่ Rejected)
+      const handleConfirmRejectionAndSave = (e) => {
+        e.preventDefault();
+        if (!rejectionModalData || !rejectionReasonInput.trim()) {
+          triggerToast("⚠️ กรุณาระบุเหตุผลในการยกเลิกหรือสละสิทธิ์");
+          return;
+        }
+        const { slotId, slotItem } = rejectionModalData;
+        const reason = rejectionReasonInput.trim();
+        const nowStr = new Date().toISOString().replace('T', ' ').substring(0, 19);
+        const nowTs = Date.now();
+        const parentReqId = slotItem?.parentRequestId || slotItem?.id || String(slotId).replace(/-\d+$/, "");
+
+        let historyEntryToAdd = null;
+        let syncedParentReq = null;
+
+        const updatedRequests = requests.map(r => {
+          if (r.id === parentReqId || (r.slots && r.slots.some(s => s.slotId === slotId))) {
+            const nextSlots = (r.slots || []).map(s => {
+              if (s.slotId === slotId) {
+                return {
+                  ...s,
+                  stage: "cancelled",
+                  stageUpdatedAt: nowTs,
+                  slotStatus: "REJECTED_BY_ADMIN",
+                  workflowStatus: "REJECTED_BY_ADMIN",
+                  onboardingArrivalStatus: "declined_noshow",
+                  rejectionReason: reason
+                };
+              }
+              return s;
+            });
+
+            const allSlotsRejectedOrCancelled = nextSlots.length > 0 && nextSlots.every(s =>
+              s.stage === "cancelled" || s.slotStatus === "Cancelled" || s.slotStatus === "REJECTED_BY_ADMIN"
+            );
+
+            if (allSlotsRejectedOrCancelled) {
+              syncedParentReq = {
+                ...r,
+                requestStatus: "REJECTED_BY_ADMIN",
+                workflowStatus: "REJECTED_BY_ADMIN",
+                stage: "cancelled",
+                rejectionReason: reason,
+                slots: nextSlots,
+                lastUpdated: nowStr
+              };
+              return syncedParentReq;
+            } else {
+              // กรณีมีหลายอัตราในคำขอเดียวกัน และยกเลิกเพียงบางอัตรา ให้เก็บประวัติไว้ใน Rejected
+              historyEntryToAdd = {
+                ...r,
+                id: slotId,
+                parentRequestId: r.id,
+                slotId: slotId,
+                jobTitle: slotItem?.jobTitle || r.jobTitle,
+                headcountRequired: 1,
+                requestStatus: "REJECTED_BY_ADMIN",
+                workflowStatus: "REJECTED_BY_ADMIN",
+                stage: "cancelled",
+                isRejectedHistory: true,
+                rejectionReason: `ยกเลิก/สละสิทธิ์ (${slotId}): ${reason}`,
+                slots: [],
+                lastUpdated: nowStr
+              };
+              return {
+                ...r,
+                slots: nextSlots,
+                lastUpdated: nowStr
+              };
+            }
+          }
+          return r;
+        });
+
+        if (historyEntryToAdd) {
+          const existIdx = updatedRequests.findIndex(item => item.id === historyEntryToAdd.id);
+          if (existIdx !== -1) {
+            updatedRequests[existIdx] = historyEntryToAdd;
+          } else {
+            updatedRequests.unshift(historyEntryToAdd);
+          }
+        }
+
+        const updatedPool = candidatePool.map(c => {
+          if (c.assignedSlotId === slotId || (slotItem?.candidateName && isSameCandidate(c.fullName, slotItem.candidateName))) {
+            return { ...c, assignedSlotId: "" };
+          }
+          return c;
+        });
+
+        setRequests(updatedRequests);
+        setCandidatePool(updatedPool);
+        localStorage.setItem(PROD_REQUESTS_KEY, JSON.stringify(updatedRequests));
+        localStorage.setItem(SHARED_CENTRAL_REQS_KEY, JSON.stringify(updatedRequests));
+        localStorage.setItem(PROD_CANDIDATES_KEY, JSON.stringify(updatedPool));
+        broadcastCentralSync(updatedRequests, updatedPool);
+
+        sendCentralSlotStageUpdate(slotId, {
+          stage: "cancelled",
+          slotStatus: "REJECTED_BY_ADMIN",
+          workflowStatus: "REJECTED_BY_ADMIN",
+          parentRequestId: parentReqId,
+          jobTitle: slotItem?.jobTitle || "",
+          department: slotItem?.department || "-",
+          onboardingArrivalStatus: "declined_noshow",
+          rejectionReason: reason,
+          ...(syncedParentReq ? { requisitionData: syncedParentReq } : historyEntryToAdd ? { isRejectedHistory: true, requisitionData: historyEntryToAdd } : {})
+        }, updatedRequests);
+
+        setSelectedDetailSlot(prev => {
+          if (prev && prev.slotId === slotId) {
+            return {
+              ...prev,
+              stage: "cancelled",
+              slotStatus: "REJECTED_BY_ADMIN",
+              workflowStatus: "REJECTED_BY_ADMIN",
+              onboardingArrivalStatus: "declined_noshow",
+              rejectionReason: reason
+            };
+          }
+          return prev;
+        });
+
+        setRejectionModalData(null);
+        setRejectionReasonInput("");
+        triggerToast(`❌ บันทึกการยกเลิก/สละสิทธิ์ Slot #${slotId} และเก็บประวัติไว้ที่ Rejected เรียบร้อยแล้ว`);
       };
 
       // Handler for slot-by-slot approval in Requisition Inspection
@@ -4806,37 +5044,6 @@ if (action === "syncTADashboardSummary" && data.summary) {
 
         setOnboardModalData(null);
         triggerToast(`🎉 บรรจุงาน Slot #${slotId} เรียบร้อย (วันเริ่มงาน: ${onboardHireDateInput}) • สถานะยังคงอยู่ใน In Progress จนกว่าจะยืนยันปิดตำแหน่ง`);
-      };
-
-      // Confirm Rejection / Cancellation with Mandatory Reason
-      const handleConfirmRejectionAndSave = (e) => {
-        e.preventDefault();
-        if (!rejectionModalData || !rejectionReasonInput.trim()) {
-          triggerToast("⚠️ กรุณาระบุเหตุผลในการยกเลิกหรือสละสิทธิ์");
-          return;
-        }
-        const { slotId, slotItem } = rejectionModalData;
-        const reason = rejectionReasonInput.trim();
-
-        updateSlotStageDirectly(slotId, "cancelled", {
-          slotStatus: "Cancelled",
-          workflowStatus: "Cancelled",
-          onboardingArrivalStatus: "declined_noshow",
-          rejectionReason: reason
-        });
-
-        const updatedPool = candidatePool.map(c => {
-          if (c.assignedSlotId === slotId || (slotItem?.candidateName && isSameCandidate(c.fullName, slotItem.candidateName))) {
-            return { ...c, assignedSlotId: "" };
-          }
-          return c;
-        });
-        setCandidatePool(updatedPool);
-        localStorage.setItem(PROD_CANDIDATES_KEY, JSON.stringify(updatedPool));
-
-        setRejectionModalData(null);
-        setRejectionReasonInput("");
-        triggerToast(`❌ บันทึกการยกเลิก/สละสิทธิ์ Slot #${slotId} เรียบร้อยแล้ว`);
       };
 
       // Confirm First-Day Training / Arrival
@@ -5310,6 +5517,7 @@ if (action === "syncTADashboardSummary" && data.summary) {
 
         const reason = rejectionNoteInput.trim();
         const nowTs = Date.now();
+        const nowStr = new Date().toISOString().replace('T', ' ').substring(0, 19);
         const targetReq = requests.find(r => r.id === reqId);
 
         const updatedRequests = requests.map(r => {
@@ -5329,24 +5537,33 @@ if (action === "syncTADashboardSummary" && data.summary) {
               stage: "cancelled",
               rejectionReason: reason,
               slots: updatedSlots,
-              lastUpdated: new Date().toISOString().replace('T', ' ').substring(0, 19)
+              lastUpdated: nowStr
             };
           }
           return r;
         });
 
+        const updatedRejectedReq = updatedRequests.find(r => r.id === reqId);
+
         setRequests(updatedRequests);
         localStorage.setItem(PROD_REQUESTS_KEY, JSON.stringify(updatedRequests));
+        localStorage.setItem(SHARED_CENTRAL_REQS_KEY, JSON.stringify(updatedRequests));
         broadcastCentralSync(updatedRequests, candidatePool);
 
-        if (targetReq && Array.isArray(targetReq.slots)) {
-          targetReq.slots.forEach(s => {
+        if (updatedRejectedReq) {
+          const slotsToSync = (updatedRejectedReq.slots && updatedRejectedReq.slots.length > 0)
+            ? updatedRejectedReq.slots
+            : [{ slotId: `${reqId}-1` }];
+          slotsToSync.forEach(s => {
             sendCentralSlotStageUpdate(s.slotId, {
               stage: "cancelled",
               slotStatus: "REJECTED_BY_ADMIN",
               workflowStatus: "REJECTED_BY_ADMIN",
               parentRequestId: reqId,
-              rejectionReason: reason
+              jobTitle: updatedRejectedReq.jobTitle,
+              department: updatedRejectedReq.department,
+              rejectionReason: reason,
+              requisitionData: updatedRejectedReq
             }, updatedRequests);
           });
         }
@@ -5362,7 +5579,7 @@ if (action === "syncTADashboardSummary" && data.summary) {
 
         setShowRejectModal(false);
         setRejectionNoteInput("");
-        triggerToast(`❌ ตีกลับคำขอ ${reqId} เรียบร้อยแล้ว`);
+        triggerToast(`❌ ตีกลับคำขอ ${reqId} และเก็บประวัติไว้ที่ Rejected เรียบร้อยแล้ว`);
       };
 
       const handleCopyShareLink = () => {
@@ -5881,6 +6098,11 @@ if (action === "syncTADashboardSummary" && data.summary) {
                                           <span className="text-amber-600 ml-1">(แทน: {req.replacedEmployeeName})</span>
                                         )}
                                       </div>
+                                      {currentStatus === "REJECTED_BY_ADMIN" && req.rejectionReason && (
+                                        <div className="text-[10px] text-rose-600 dark:text-rose-400 font-medium mt-0.5 truncate max-w-[260px]" title={req.rejectionReason}>
+                                          เหตุผล: {req.rejectionReason}
+                                        </div>
+                                      )}
                                     </td>
                                     <td className="px-4 py-3 text-slate-600 dark:text-slate-300 font-normal">{req.department}</td>
                                     <td className="px-4 py-3 text-center font-medium">{req.headcountRequired || 1}</td>
