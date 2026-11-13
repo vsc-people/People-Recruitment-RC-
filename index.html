@@ -890,6 +890,15 @@
       });
 
       const [googleScriptUrl, setGoogleScriptUrl] = useState(() => {
+        try {
+          const urlParamScript = new URLSearchParams(window.location.search).get("scriptUrl");
+          if (urlParamScript && urlParamScript.trim().startsWith("https://script.google.com/")) {
+            const cleanParamUrl = urlParamScript.trim();
+            localStorage.setItem("hr_apps_script_url_v64", cleanParamUrl);
+            localStorage.setItem("hr_apps_script_url_v62", cleanParamUrl);
+            return cleanParamUrl;
+          }
+        } catch (e) {}
         const savedUrl = localStorage.getItem("hr_apps_script_url_v64") || localStorage.getItem("hr_apps_script_url_v62");
         if (savedUrl && savedUrl.trim()) {
           return savedUrl.trim();
@@ -900,6 +909,7 @@
 
       const [lastSyncedTime, setLastSyncedTime] = useState(() => new Date().toLocaleTimeString('th-TH'));
       const [isSyncing, setIsSyncing] = useState(false);
+      const [centralSyncStatus, setCentralSyncStatus] = useState("syncing");
       const [showResetConfirmModal, setShowResetConfirmModal] = useState(false);
       const [isResetting, setIsResetting] = useState(false);
 
@@ -1232,6 +1242,9 @@
           }
 
           if (resJson && resJson.status === "success") {
+            const hasServerStateSchema = Array.isArray(resJson.requisitions) || (resJson.slotStages && typeof resJson.slotStages === "object");
+            setCentralSyncStatus(hasServerStateSchema ? "connected" : "offline");
+
             // ตรวจสอบว่าแอดมินสั่งล้างข้อมูลกลางจากเครื่องอื่นหรือไม่ หากใช่ให้ล้างแคชเครื่องนี้ให้ตรงกันทันที
             if (resJson.lastResetAt) {
               const localResetAt = localStorage.getItem(LAST_KNOWN_RESET_KEY) || "";
@@ -1511,6 +1524,24 @@
                 });
               }
 
+              // สร้างดัชนีรายการที่มีอยู่จริงบน Central Hub เพื่อซิงค์ให้ทุกหน้าต่าง/ทุก User เห็นข้อมูลชุดเดียวกัน
+              const serverKnownSlotIds = new Set(Object.keys(slotStages || {}));
+              const serverKnownReqIds = new Set();
+              (remoteRequisitions || []).forEach(rr => {
+                if (rr && rr.id) {
+                  serverKnownReqIds.add(rr.id);
+                  if (Array.isArray(rr.slots)) {
+                    rr.slots.forEach(sl => sl && sl.slotId && serverKnownSlotIds.add(sl.slotId));
+                  }
+                }
+              });
+              Object.entries(slotStages || {}).forEach(([sk, sd]) => {
+                if (sd && !sd.isDeleted) {
+                  const pId = sd.parentRequestId || sd.requisitionData?.id || String(sk).replace(/-\d+$/, "");
+                  if (pId) serverKnownReqIds.add(pId);
+                }
+              });
+
               // 2. นำสถานะกลาง (Central Live Overrides) มาใช้กับทุก Slot โดยกรองรายการที่ลบแล้วทิ้ง 100%
               const updatedList = baseList.map(r => {
                 if (currentDeletedReqs.has(r.id) || currentDeletedSlots.has(r.id)) return null;
@@ -1530,6 +1561,13 @@
 
                   if (stageOverride?.isDeleted) {
                     return null; // ลบออกตามคำสั่งของแอดมินกลาง
+                  }
+
+                  // หาก Central Hub ตอบกลับสมบูรณ์แล้ว และรายการนี้ไม่อยู่บนเซิร์ฟเวอร์ (ถูกลบหรือรีเซ็ตจากหน้าต่างอื่น) ให้ลบออกให้ตรงกัน
+                  const isNewlyCreatedLocal = s.stageUpdatedAt && (Date.now() - s.stageUpdatedAt < 15000);
+                  const existsOnServer = serverKnownSlotIds.has(s.slotId) || serverKnownReqIds.has(mainId);
+                  if (hasServerStateSchema && !existsOnServer && !isNewlyCreatedLocal) {
+                    return null;
                   }
 
                   const hasRecentLocalUpdate = s.stageUpdatedAt && (Date.now() - s.stageUpdatedAt < 60000);
@@ -1623,11 +1661,22 @@
             });
 
             setLastSyncedTime(new Date().toLocaleTimeString('th-TH'));
+            if (!hasServerStateSchema) {
+              try { await syncRequisitionsFromGoogleSheet(false); } catch (eFallback) {}
+            }
             if (!silent) {
-              triggerToast("✅ ซิงค์ข้อมูลกลาง (Central Hub) เรียบร้อยแล้ว!");
+              triggerToast(
+                hasServerStateSchema
+                  ? "✅ ซิงค์ข้อมูลกลาง (Central Hub) เรียบร้อยแล้ว!"
+                  : "⚠️ เชื่อมต่อ Script เดิมอยู่ (กรุณาอัปเดตโค้ด Code.gs และ Deploy เวอร์ชันใหม่)"
+              );
             }
           }
         } catch (err) {
+          setCentralSyncStatus("offline");
+          try {
+            await syncRequisitionsFromGoogleSheet(false);
+          } catch (sheetErr) {}
           if (!silent) {
             triggerToast("⚠️ ไม่สามารถซิงค์สถานะได้ (ตรวจสอบ Web App URL)");
           }
@@ -1644,6 +1693,11 @@
           const csvText = await res.text();
           const rows = parseCSVText(csvText);
 
+          let localDelSlots = new Set(deletedSlotIds);
+          let localDelReqs = new Set(deletedReqIds);
+          try { JSON.parse(localStorage.getItem(DELETED_SLOTS_KEY) || "[]").forEach(id => localDelSlots.add(id)); } catch (e) {}
+          try { JSON.parse(localStorage.getItem(DELETED_REQS_KEY) || "[]").forEach(id => localDelReqs.add(id)); } catch (e) {}
+
           if (rows.length > 1) {
             const parsedList = [];
             for (let i = 1; i < rows.length; i++) {
@@ -1651,24 +1705,37 @@
               if (!r || r.length < 2) continue;
               const reqId = (r[0] || "").trim();
               if (!reqId || reqId.toLowerCase().includes("request")) continue;
+              if (localDelReqs.has(reqId) || localDelSlots.has(reqId)) continue;
 
               const headcount = Math.max(1, parseInt(r[11], 10) || 1);
               const driveUrl = (r[32] || "").trim();
               const candName = (r[30] || "").trim();
               const candPhone = (r[31] || "").trim();
+              const rawSheetStatus = (r[28] || "PENDING_ADMIN").trim();
+              const inferredStage = rawSheetStatus === "Closed"
+                ? "onboarded"
+                : (rawSheetStatus === "Cancelled" || rawSheetStatus === "REJECTED_BY_ADMIN")
+                ? "cancelled"
+                : (rawSheetStatus === "READY_FOR_RECRUITMENT" || rawSheetStatus === "Recruiting")
+                ? "manpower"
+                : "received";
 
               const slots = Array.from({ length: headcount }, (_, idx) => ({
                 slotId: `${reqId}-${idx + 1}`,
                 slotIndex: idx + 1,
-                slotStatus: r[28] || "PENDING_ADMIN",
-                workflowStatus: r[28] || "PENDING_ADMIN",
-                stage: "received",
+                slotStatus: rawSheetStatus,
+                workflowStatus: rawSheetStatus,
+                stage: inferredStage,
+                jobTitle: (r[10] || "").trim(),
                 candidateName: candName,
                 candidatePhone: candPhone,
                 resumeUrl: driveUrl,
                 driveUrl: driveUrl,
+                authorizedEmails: [],
                 evaluations: []
-              }));
+              })).filter(sl => !localDelSlots.has(sl.slotId));
+
+              if (slots.length === 0) continue;
 
               parsedList.push({
                 id: reqId,
@@ -1699,8 +1766,8 @@
                 itSimCard: (r[25] || "ไม่ต้องการ").trim(),
                 itEmail: (r[26] || "ต้องการ").trim(),
                 itNetsuite: (r[27] || "ไม่ต้องการ").trim(),
-                requestStatus: (r[28] || "PENDING_ADMIN").trim(),
-                workflowStatus: (r[28] || "PENDING_ADMIN").trim(),
+                requestStatus: rawSheetStatus,
+                workflowStatus: rawSheetStatus,
                 lastUpdated: (r[29] || "").trim(),
                 candidateName: candName,
                 candidatePhone: candPhone,
@@ -5198,8 +5265,11 @@ if (action === "syncTADashboardSummary" && data.summary) {
 
       const handleCopyShareLink = () => {
         const baseUrl = window.location.href.split('?')[0];
+        const shareUrl = (googleScriptUrl && googleScriptUrl !== DEFAULT_APPS_SCRIPT_WEBAPP_URL)
+          ? `${baseUrl}?scriptUrl=${encodeURIComponent(googleScriptUrl)}`
+          : baseUrl;
         const textArea = document.createElement("textarea");
-        textArea.value = baseUrl;
+        textArea.value = shareUrl;
         document.body.appendChild(textArea);
         textArea.select();
         document.execCommand('copy');
@@ -5771,9 +5841,14 @@ if (action === "syncTADashboardSummary" && data.summary) {
                                 type="button"
                                 onClick={() => syncWorkflowStatus(false)}
                                 disabled={isSyncing}
-                                className="h-8 px-2.5 rounded-lg hover:bg-white dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold inline-flex items-center gap-1 transition cursor-pointer whitespace-nowrap"
-                                title={`Sync Now (${lastSyncedTime})`}
+                                className="h-8 px-2.5 rounded-lg hover:bg-white dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold inline-flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap"
+                                title={
+                                  centralSyncStatus === "connected"
+                                    ? `Central Hub Connected (${lastSyncedTime}) - คลิกเพื่อซิงค์ทันที`
+                                    : "Apps Script ยังไม่เชื่อมต่อหรือยังไม่ได้อัปเดต Code.gs ล่าสุด - คลิกเพื่อลองซิงค์ใหม่"
+                                }
                               >
+                                <span className={`w-2 h-2 rounded-full shrink-0 ${centralSyncStatus === "connected" ? "bg-emerald-500" : "bg-amber-500 animate-pulse"}`}></span>
                                 <span className={`text-sm leading-none ${isSyncing ? "animate-spin inline-block" : ""}`}>🔄</span>
                                 <span className="hidden md:inline text-[11px] font-mono text-slate-600 dark:text-slate-300">{lastSyncedTime}</span>
                               </button>
