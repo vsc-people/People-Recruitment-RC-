@@ -175,6 +175,7 @@
     const GOOGLE_SHEET_DIRECTORY_CSV_URL = "https://docs.google.com/spreadsheets/d/1f2bk8JFA0eVLhkAqT-9aEWPHM2A638uSc-hbx6QDZpw/gviz/tq?tqx=out:csv&gid=62738333";
     const GOOGLE_SHEET_CANDIDATES_CSV_URL = "https://docs.google.com/spreadsheets/d/1RwhCPu0sdV2lpzea2-2BbDoc86nfplooShYIzTkMgrw/gviz/tq?tqx=out:csv&gid=546067727";
     const GOOGLE_SHEET_MANPOWER_CSV_URL = "https://docs.google.com/spreadsheets/d/1RwhCPu0sdV2lpzea2-2BbDoc86nfplooShYIzTkMgrw/gviz/tq?tqx=out:csv&gid=1528284561";
+    const GOOGLE_SHEET_APP_CONFIG_CSV_URL = "https://docs.google.com/spreadsheets/d/1RwhCPu0sdV2lpzea2-2BbDoc86nfplooShYIzTkMgrw/gviz/tq?tqx=out:csv&sheet=App_Config";
     const CANDIDATES_SHEET_EDIT_URL = "https://docs.google.com/spreadsheets/d/1RwhCPu0sdV2lpzea2-2BbDoc86nfplooShYIzTkMgrw/edit?gid=546067727#gid=546067727";
     const DASHBOARD_SUMMARY_SHEET_GID = "1491221874";
     const DASHBOARD_SUMMARY_SHEET_URL = "https://docs.google.com/spreadsheets/d/1RwhCPu0sdV2lpzea2-2BbDoc86nfplooShYIzTkMgrw/edit?gid=1491221874#gid=1491221874";
@@ -912,6 +913,49 @@
       const [centralSyncStatus, setCentralSyncStatus] = useState("syncing");
       const [showResetConfirmModal, setShowResetConfirmModal] = useState(false);
       const [isResetting, setIsResetting] = useState(false);
+      const lastLocalResetAtRef = useRef(0);
+
+      // ดึงลิงก์ Google Apps Script ล่าสุดที่ Admin ตั้งค่าไว้จากแผ่นงาน App_Config อัตโนมัติ (ให้ทุก User และทุกหน้าต่างเชื่อมศูนย์กลางเดียวกัน)
+      const syncActiveScriptUrlFromSheet = async () => {
+        try {
+          const res = await fetch(`${GOOGLE_SHEET_APP_CONFIG_CSV_URL}&_t=${Date.now()}`, { cache: "no-store" });
+          if (!res.ok) return null;
+          const csvText = await res.text();
+          const rows = parseCSVText(csvText);
+          for (let i = 0; i < rows.length; i++) {
+            const key = String(rows[i][0] || "").trim();
+            const val = String(rows[i][1] || "").trim();
+            if (key === "ACTIVE_SCRIPT_URL" && val.startsWith("https://script.google.com/")) {
+              const currentSaved = localStorage.getItem("hr_apps_script_url_v64") || googleScriptUrl;
+              if (val !== currentSaved) {
+                localStorage.setItem("hr_apps_script_url_v64", val);
+                localStorage.setItem("hr_apps_script_url_v62", val);
+                setGoogleScriptUrl(val);
+              }
+              return val;
+            }
+          }
+        } catch (e) {}
+        return null;
+      };
+
+      // บันทึกลิงก์ Web App URL ที่ Admin ตั้งค่าลงแผ่นงาน App_Config ของ Google Sheet
+      const persistActiveScriptUrlToCentralConfig = (newScriptUrl) => {
+        if (!newScriptUrl) return;
+        const targets = [newScriptUrl, DEFAULT_APPS_SCRIPT_WEBAPP_URL, BACKUP_APPS_SCRIPT_WEBAPP_URL]
+          .filter((u, i, arr) => u && arr.indexOf(u) === i);
+        targets.forEach(u => {
+          try {
+            fetch(`${u}?action=saveAppConfig&scriptUrl=${encodeURIComponent(newScriptUrl)}&_t=${Date.now()}`, { mode: "no-cors", cache: "no-store" }).catch(() => {});
+            fetch(u, {
+              method: "POST",
+              mode: "no-cors",
+              headers: { "Content-Type": "text/plain" },
+              body: JSON.stringify({ action: "saveAppConfig", scriptUrl: newScriptUrl })
+            }).catch(() => {});
+          } catch (e) {}
+        });
+      };
 
       // ฟังก์ชันกระจายสัญญาณอัปเดตแบบเรียลไทม์ระหว่างหน้าต่าง/แท็บทันที (0ms Latency)
       const broadcastCentralSync = (updatedRequests = null, updatedCandidates = null, overrideDeletedSlots = null, overrideDeletedReqs = null) => {
@@ -1098,6 +1142,7 @@
             stagePayload.department ? `department=${encodeURIComponent(stagePayload.department)}` : "",
             stagePayload.requesterName ? `requesterName=${encodeURIComponent(stagePayload.requesterName)}` : "",
             stagePayload.candidateName !== undefined ? `candidateName=${encodeURIComponent(stagePayload.candidateName)}` : "",
+            stagePayload.isArchivedFromKanban !== undefined ? `isArchivedFromKanban=${stagePayload.isArchivedFromKanban ? "true" : "false"}` : "",
             stagePayload.authorizedEmails !== undefined ? `authorizedEmails=${encodeURIComponent(JSON.stringify(normalizeAuthorizedEmails(stagePayload.authorizedEmails)))}` : ""
           ].filter(Boolean).join("&");
 
@@ -1167,12 +1212,12 @@
       };
 
       // Helper: ดึงข้อมูลกลางแบบทะลุกฎ CORS (Clean Simple Fetch + JSONP Fallback 100%)
-      const fetchCentralData = async (targetUrl) => {
+      const fetchCentralData = async (targetUrl, actionName = "getWorkflowStatuses") => {
         if (!targetUrl) throw new Error("No URL provided");
 
         // 1. ลองใช้ Simple GET fetch (ไม่มี Custom Headers เพื่อไม่ให้ติด CORS Preflight OPTIONS)
         try {
-          const cleanUrl = `${targetUrl}?action=getWorkflowStatuses&_t=${Date.now()}`;
+          const cleanUrl = `${targetUrl}?action=${encodeURIComponent(actionName)}&_t=${Date.now()}`;
           const res = await fetch(cleanUrl, { method: "GET" });
           if (res.ok) {
             const json = await res.json();
@@ -1216,25 +1261,34 @@
           };
 
           const sep = targetUrl.includes("?") ? "&" : "?";
-          script.src = `${targetUrl}${sep}action=getWorkflowStatuses&callback=${cbName}&_t=${Date.now()}`;
+          script.src = `${targetUrl}${sep}action=${encodeURIComponent(actionName)}&callback=${cbName}&_t=${Date.now()}`;
           document.body.appendChild(script);
         });
       };
 
       // Real-time Background Polling & Manual Sync Function (Central Source of Truth)
       const syncWorkflowStatus = async (silent = true) => {
-        const urlToUse = googleScriptUrl || DEFAULT_APPS_SCRIPT_WEBAPP_URL;
+        // ป้องกันการดึงข้อมูลเก่ามาทับระหว่างที่เพิ่งกดล้างข้อมูลระบบ (ภายใน 6 วินาทีแรก)
+        if (lastLocalResetAtRef.current && (Date.now() - lastLocalResetAtRef.current < 6000)) {
+          return;
+        }
+
+        let urlToUse = localStorage.getItem("hr_apps_script_url_v64") || googleScriptUrl || DEFAULT_APPS_SCRIPT_WEBAPP_URL;
         if (!urlToUse) return;
         if (!silent) setIsSyncing(true);
 
         try {
           let resJson = null;
 
-          // ลองดึงจาก URL หลักก่อน ถ้าไม่สำเร็จให้ลอง URL สำรองอัตโนมัติ
+          // ลองดึงจาก URL หลักก่อน ถ้าไม่สำเร็จให้ลองตรวจสอบ App_Config ใน Sheet และ URL สำรองอัตโนมัติ
           try {
             resJson = await fetchCentralData(urlToUse);
           } catch (primaryErr) {
-            if (BACKUP_APPS_SCRIPT_WEBAPP_URL && BACKUP_APPS_SCRIPT_WEBAPP_URL !== urlToUse) {
+            const sheetConfigUrl = await syncActiveScriptUrlFromSheet();
+            if (sheetConfigUrl && sheetConfigUrl !== urlToUse) {
+              urlToUse = sheetConfigUrl;
+              resJson = await fetchCentralData(sheetConfigUrl);
+            } else if (BACKUP_APPS_SCRIPT_WEBAPP_URL && BACKUP_APPS_SCRIPT_WEBAPP_URL !== urlToUse) {
               resJson = await fetchCentralData(BACKUP_APPS_SCRIPT_WEBAPP_URL);
             } else {
               throw primaryErr;
@@ -1242,7 +1296,22 @@
           }
 
           if (resJson && resJson.status === "success") {
-            const hasServerStateSchema = Array.isArray(resJson.requisitions) || (resJson.slotStages && typeof resJson.slotStages === "object");
+            let hasServerStateSchema = Array.isArray(resJson.requisitions) || (resJson.slotStages && typeof resJson.slotStages === "object");
+
+            // หาก URL ปัจจุบันเป็น Script เก่า ให้ลองเช็กลิงก์ใหม่จากแผ่นงาน App_Config อัตโนมัติ (ช่วยให้ฝั่ง User อัปเดตลิงก์ตาม Admin ทันที)
+            if (!hasServerStateSchema) {
+              const sheetConfigUrl = await syncActiveScriptUrlFromSheet();
+              if (sheetConfigUrl && sheetConfigUrl !== urlToUse) {
+                try {
+                  const upgradedRes = await fetchCentralData(sheetConfigUrl);
+                  if (upgradedRes && upgradedRes.status === "success") {
+                    resJson = upgradedRes;
+                    hasServerStateSchema = Array.isArray(resJson.requisitions) || (resJson.slotStages && typeof resJson.slotStages === "object");
+                  }
+                } catch (errUp) {}
+              }
+            }
+
             setCentralSyncStatus(hasServerStateSchema ? "connected" : "offline");
 
             // ตรวจสอบว่าแอดมินสั่งล้างข้อมูลกลางจากเครื่องอื่นหรือไม่ หากใช่ให้ล้างแคชเครื่องนี้ให้ตรงกันทันที
@@ -1828,9 +1897,9 @@
 
       // Auto-Polling ทุก 2.5 วินาที และซิงค์ทันทีเมื่อสลับหน้าต่างกลับมา
       useEffect(() => {
-        syncWorkflowStatus(true);
-        // หมายเหตุ: ไม่ดึงข้อมูลเก่าจาก Google Sheet CSV อัตโนมัติเมื่อเริ่มระบบ เพื่อให้เริ่มต้นใช้งานใหม่ได้อย่างสะอาดหมดจด
-        // (สามารถกดปุ่ม "ซิงค์จาก Sheet" ได้เองเมื่อต้องการนำเข้า)
+        syncActiveScriptUrlFromSheet().finally(() => {
+          syncWorkflowStatus(true);
+        });
 
         const pollingInterval = setInterval(() => {
           syncWorkflowStatus(true);
@@ -4936,37 +5005,70 @@ if (action === "syncTADashboardSummary" && data.summary) {
       // Reset App Data Handler (from Kanban Reset Button)
       const handleResetAppData = async () => {
         setIsResetting(true);
-        try {
-          localStorage.removeItem(PROD_REQUESTS_KEY);
-          localStorage.removeItem(SHARED_CENTRAL_REQS_KEY);
-          localStorage.removeItem(DELETED_SLOTS_KEY);
-          localStorage.removeItem(DELETED_REQS_KEY);
+        const resetGuardNow = Date.now();
+        lastLocalResetAtRef.current = resetGuardNow;
 
-          setRequests([]);
-          setDeletedSlotIds(new Set());
-          setDeletedReqIds(new Set());
-          setCandidatePool(prev => {
-            const cleaned = prev.map(c => ({ ...c, assignedSlotId: "" }));
-            localStorage.setItem(PROD_CANDIDATES_KEY, JSON.stringify(cleaned));
-            return cleaned;
+        try {
+          // 1. รวบรวมรหัสคำขอและตำแหน่งทั้งหมดที่มีอยู่เพื่อบันทึกเป็น Tombstone ป้องกันข้อมูลเก่าเด้งกลับ
+          const allExistingReqIds = new Set(deletedReqIds);
+          const allExistingSlotIds = new Set(deletedSlotIds);
+          requests.forEach(r => {
+            if (r && r.id) allExistingReqIds.add(r.id);
+            (r.slots || []).forEach(s => {
+              if (s && s.slotId) allExistingSlotIds.add(s.slotId);
+            });
           });
 
-          broadcastCentralSync([], candidatePool.map(c => ({ ...c, assignedSlotId: "" })));
+          // 2. ล้างข้อมูลใน LocalStorage และบันทึก Tombstone ทันที
+          localStorage.removeItem(PROD_REQUESTS_KEY);
+          localStorage.removeItem(SHARED_CENTRAL_REQS_KEY);
+          localStorage.setItem(DELETED_SLOTS_KEY, JSON.stringify(Array.from(allExistingSlotIds)));
+          localStorage.setItem(DELETED_REQS_KEY, JSON.stringify(Array.from(allExistingReqIds)));
 
-          if (googleScriptUrl) {
+          const cleanedCandidates = candidatePool.map(c => ({ ...c, assignedSlotId: "" }));
+          localStorage.setItem(PROD_CANDIDATES_KEY, JSON.stringify(cleanedCandidates));
+
+          // 3. ล้าง State ในหน้าจอทันที
+          setRequests([]);
+          setDeletedSlotIds(allExistingSlotIds);
+          setDeletedReqIds(allExistingReqIds);
+          setSelectedDetailSlot(null);
+          setSelectedRequisitionDetail(null);
+          setCandidatePool(cleanedCandidates);
+
+          // 4. กระจายคำสั่งล้างข้อมูลไปยังทุกแท็บ/หน้าต่างในเบราว์เซอร์เดียวกันทันที (0ms)
+          broadcastCentralSync([], cleanedCandidates, allExistingSlotIds, allExistingReqIds);
+
+          // 5. ส่งคำสั่งล้างข้อมูลกลางไปยัง Google Apps Script ทุก URL และรอรับค่า lastResetAt ยืนยัน
+          const targetUrls = [googleScriptUrl, DEFAULT_APPS_SCRIPT_WEBAPP_URL, BACKUP_APPS_SCRIPT_WEBAPP_URL]
+            .filter((u, i, arr) => u && arr.indexOf(u) === i);
+
+          let confirmedResetAt = new Date().toISOString();
+          for (const targetUrl of targetUrls) {
             try {
-              fetch(`${googleScriptUrl}?action=resetCentralState&_t=${Date.now()}`, { mode: 'no-cors' }).catch(() => {});
-              fetch(googleScriptUrl, {
+              const resetRes = await fetchCentralData(targetUrl, "resetCentralState");
+              if (resetRes && resetRes.lastResetAt) {
+                confirmedResetAt = resetRes.lastResetAt;
+              }
+            } catch (errGet) {
+              try {
+                fetch(`${targetUrl}?action=resetCentralState&_t=${Date.now()}`, { mode: "no-cors", cache: "no-store" }).catch(() => {});
+              } catch (e2) {}
+            }
+            try {
+              fetch(targetUrl, {
                 method: "POST",
                 mode: "no-cors",
                 headers: { "Content-Type": "text/plain" },
                 body: JSON.stringify({ action: "resetCentralState" })
               }).catch(() => {});
-            } catch (err) {}
+            } catch (errPost) {}
           }
 
+          localStorage.setItem(LAST_KNOWN_RESET_KEY, confirmedResetAt);
+          setLastSyncedTime(new Date().toLocaleTimeString('th-TH'));
           setShowResetConfirmModal(false);
-          triggerToast("🧹 ล้างข้อมูลคำขอและตำแหน่งงานทั้งหมดเรียบร้อยแล้ว!");
+          triggerToast("🧹 ล้างข้อมูลคำขอและตำแหน่งงานทั้งหมดเรียบร้อยแล้ว! (ซิงค์ทุกหน้าต่างตรงกัน)");
         } finally {
           setIsResetting(false);
         }
@@ -8947,8 +9049,10 @@ if (action === "syncTADashboardSummary" && data.summary) {
                       setGoogleScriptUrl(trimmed);
                       localStorage.setItem("hr_apps_script_url_v64", trimmed);
                       localStorage.setItem("hr_apps_script_url_v62", trimmed);
+                      persistActiveScriptUrlToCentralConfig(trimmed);
                       setShowSheetsModal(false);
-                      triggerToast("✅ บันทึกลิงก์ Google Apps Script ใหม่เรียบร้อยแล้ว!");
+                      syncWorkflowStatus(false);
+                      triggerToast("✅ บันทึกลิงก์ Google Apps Script ใหม่และซิงค์ให้ทุกหน้าต่างเรียบร้อยแล้ว!");
                     }}
                     className="px-5 py-2 rounded-xl text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 shadow-md cursor-pointer"
                   >
